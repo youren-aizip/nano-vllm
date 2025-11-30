@@ -13,7 +13,6 @@ from nanovllm.engine.model_runner import ModelRunner
 
 
 class LLMEngine:
-
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
@@ -43,13 +42,16 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
-        self.scheduler.add(seq)
+        self.scheduler.add(seq)  # add the sequence to the waiting queue
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
+        seqs, is_prefill = self.scheduler.schedule()  # scheduler prioritizes prefill over decode
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        # the number of tokens for prefill is all the tokens in the all sequences,
+        # the number of tokens for decode is the number of sequences
+        # positive for prefill, negative for decode (hack for distinction between prefill and decode)
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
@@ -69,8 +71,8 @@ class LLMEngine:
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
-        while not self.is_finished():
+        prefill_throughput = decode_throughput = 0.0
+        while not self.is_finished():  # generate until all sequences are finished
             t = perf_counter()
             output, num_tokens = self.step()
             if use_tqdm:
@@ -78,10 +80,12 @@ class LLMEngine:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}tok/s",
-                    "Decode": f"{int(decode_throughput)}tok/s",
-                })
+                pbar.set_postfix(
+                    {
+                        "Prefill": f"{int(prefill_throughput)}tok/s",
+                        "Decode": f"{int(decode_throughput)}tok/s",
+                    }
+                )
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:

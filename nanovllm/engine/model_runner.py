@@ -207,9 +207,9 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None # only sample in rank 0
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None # only sample in rank 0
         reset_context()
         return token_ids
 
