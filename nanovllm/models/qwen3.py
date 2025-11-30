@@ -12,7 +12,6 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -36,7 +35,7 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
@@ -88,6 +87,64 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
+    """
+    Qwen3 MLP with merged gate and up projections.
+
+    Original (2 linear layers):
+                        x (hidden_states)
+                        │
+             ┌──────────┴──────────┐
+             ▼                     ▼
+        gate_proj(x)           up_proj(x)
+        (hidden → inter)      (hidden → inter)
+             │                     │
+             ▼                     │
+          SiLU(gate)               │
+             │                     │
+             └──────── × ──────────┘  (element-wise multiply)
+                       │
+                       ▼
+                 down_proj
+                (inter → hidden)
+                       │
+                       ▼
+                    output
+
+    Merged (1 linear layer):
+        Since gate_proj and up_proj share the same input x, we can merge them.
+        In Y = X @ W.T, we merge W_gate.T and W_up.T by column:
+
+        W_gate.T ∈ R^{hidden × inter}     ┌───────────────────────────┐
+        W_up.T   ∈ R^{hidden × inter}  →  │  W_gate.T  │   W_up.T     │ ∈ R^{hidden × 2*inter}
+                                          └───────────────────────────┘
+
+        gate_up = x @ [W_gate.T | W_up.T]  (1 matmul instead of 2)
+        gate, up = split(gate_up)
+        output = down_proj(silu(gate) * up)
+
+    Tensor Parallel (Column → Row pairing):
+                            x
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │  gate_up_proj         │  ← ColumnParallel
+                │  (hidden → 2*inter)   │    output split by column to GPUs
+                └───────────────────────┘
+                            │
+                            │  no communication needed!
+                            │  (Column output format = Row input format)
+                            ▼
+                      silu(gate) * up
+                            │
+                            ▼
+                ┌───────────────────────┐
+                │  down_proj            │  ← RowParallel
+                │  (inter → hidden)     │    all_reduce to get full output
+                └───────────────────────┘
+                            │
+                            ▼ all_reduce
+                         output
+    """
 
     def __init__(
         self,
@@ -117,7 +174,6 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen3Config,
@@ -129,8 +185,8 @@ class Qwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            head_dim=getattr(config, 'head_dim', None),
+            qkv_bias=getattr(config, "attention_bias", True),
+            head_dim=getattr(config, "head_dim", None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
@@ -159,7 +215,6 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-
     def __init__(
         self,
         config: Qwen3Config,
@@ -191,14 +246,12 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(
-        self,
-        config: Qwen3Config
-    ) -> None:
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
+            # the weight of the lm_head is the same as the weight of the embed_tokens
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
